@@ -1,0 +1,11 @@
+{
+  "buildCommand": "pnpm build",
+  "devCommand": "pnpm dev",
+  "installCommand": "pnpm install",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "env": {
+    "NEXT_PUBLIC_BACKEND_URL": "@next_public_backend_url",
+    "NEXT_PUBLIC_ARC_RPC_URL": "@next_public_arc_rpc_url"
+  }
+}

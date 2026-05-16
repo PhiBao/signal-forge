@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+node_modules/
+.next/
+.venv/
+*.egg-info/
+recovery/
+.DS_Store
+*.log

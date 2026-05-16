@@ -1,0 +1,17 @@
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          URL="https://signal-forge.onrender.com"
+          echo "Pinging $URL/api/health ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/health")
+          echo "Status: $STATUS"

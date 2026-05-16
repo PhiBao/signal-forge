@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: signalforge-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn agents.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: ARC_RPC_URL
+        sync: false
+      - key: ARC_PRIVATE_KEY
+        sync: false
+      - key: ARC_CHAIN_ID
+        value: "5042002"
+      - key: USDC_CONTRACT_ADDRESS
+        value: "0x3600000000000000000000000000000000000000"
+      - key: DGRID_API_KEY
+        sync: false
+      - key: DGRID_MODEL
+        value: "openai/gpt-4o-mini"
+      - key: POLY_GAMMA_API
+        value: "https://gamma-api.polymarket.com"
+      - key: POLY_CLOB_API
+        value: "https://clob.polymarket.com"
+      - key: CIRCLE_API_KEY
+        sync: false
+      - key: CIRCLE_ENTITY_SECRET
+        sync: false
+      - key: CIRCLE_WALLET_ID
+        sync: false
