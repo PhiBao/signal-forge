@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Ping Render health endpoint
         run: |
-          URL="https://signal-forge.onrender.com"
+          URL="https://signalforge-api-0hlc.onrender.com"
           echo "Pinging $URL/api/health ..."
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/health")
           echo "Status: $STATUS"
