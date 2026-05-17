@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { useAccount, useConnect, useDisconnect, useSignTypedData, useWriteContract, useReadContract } from "wagmi";
+import { useAccount, useConnect, useDisconnect, useSignTypedData, useWriteContract, useReadContract, useSwitchChain } from "wagmi";
 import { injected } from "wagmi/connectors";
 import { parseUnits, formatUnits } from "viem";
 
@@ -177,9 +177,6 @@ export default function Home() {
     },
   });
 
-  const { signTypedDataAsync } = useSignTypedData();
-  const { writeContractAsync } = useWriteContract();
-
   const { data: usdcBalance } = useReadContract({
     address: USDC_ADDRESS,
     abi: USDC_ABI,
@@ -188,10 +185,20 @@ export default function Home() {
     query: { enabled: !!address },
   });
 
+  const { switchChainAsync } = useSwitchChain();
+  const { signTypedDataAsync } = useSignTypedData();
+  const { writeContractAsync } = useWriteContract();
+
   const subscribeMutation = useMutation({
     mutationFn: async (addr: string) => {
       if (!isConnected) {
         throw new Error("Wallet not connected");
+      }
+      
+      try {
+        await switchChainAsync({ chainId: 5042002 });
+      } catch {
+        // Chain might already be added
       }
       
       addLog("Fetching x402 payment requirements from Circle Gateway...");
@@ -808,6 +815,11 @@ export default function Home() {
               <ConfigSelect label="mode" value={config?.paper_trade ? "paper" : "live"} options={[
                 { value: "paper", label: "Paper Trade" }, { value: "live", label: "Live" },
               ]} onChange={(v) => handleConfigChange("paper_trade", v === "paper")} />
+              <ConfigSelect label="cycle" value={config?.auto_cycle_minutes || 15} options={[
+                { value: 5, label: "5m" }, { value: 10, label: "10m" },
+                { value: 15, label: "15m" }, { value: 30, label: "30m" },
+                { value: 60, label: "60m" },
+              ]} onChange={(v) => handleConfigChange("auto_cycle_minutes", Number(v))} />
             </div>
           </div>
         </div>

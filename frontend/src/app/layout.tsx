@@ -5,6 +5,9 @@ import { Providers } from "./providers";
 export const metadata: Metadata = {
   title: "SignalForge — Autonomous Prediction Market Agent",
   description: "AI-powered prediction market intelligence. DGrid AI analysis, Kelly Criterion sizing, Arc-anchored reasoning traces.",
+  icons: {
+    icon: "/favicon.svg",
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
