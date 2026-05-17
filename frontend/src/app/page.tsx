@@ -190,6 +190,10 @@ export default function Home() {
 
   const subscribeMutation = useMutation({
     mutationFn: async (addr: string) => {
+      if (!isConnected) {
+        throw new Error("Wallet not connected");
+      }
+      
       addLog("Fetching x402 payment requirements from Circle Gateway...");
       const requirements = await fetchJson(`/api/subscribe/payment-requirements?user_address=${addr}&price=0.01`);
 
@@ -254,7 +258,11 @@ export default function Home() {
     onSuccess: async (_, addr) => {
       refetchStatus();
       await refetchSubscriptions();
+      setShowSubscriptions(true);
       addLog(`Subscribed: ${addr.slice(0, 8)}... — $0.01/signal via Circle Nanopayments`);
+    },
+    onError: (error: any) => {
+      addLog(`Subscribe failed: ${error?.message || error}`);
     },
   });
 

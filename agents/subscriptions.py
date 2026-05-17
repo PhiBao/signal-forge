@@ -51,7 +51,13 @@ class SubscriptionManager:
         self.total_signals_delivered: int = 0
 
     def subscribe(self, user_address: str, price_per_signal: float = 0.01) -> Subscription:
-        """Create a new subscription for a user."""
+        """Create a new subscription for a user. Returns existing if already subscribed."""
+        # Check for existing active subscription
+        for sub in self.subscriptions.values():
+            if sub.user_address.lower() == user_address.lower() and sub.active:
+                logger.info(f"Existing subscription found for {user_address}")
+                return sub
+        
         sub = Subscription(
             user_address=user_address,
             price_per_signal_usd=price_per_signal,
