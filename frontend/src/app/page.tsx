@@ -538,6 +538,8 @@ export default function Home() {
                     <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${
                       val.status === "integrated"
                         ? "bg-[#00ff41]/10 text-[#00ff41] border border-[#00ff41]/20"
+                        : val.status === "planned"
+                        ? "bg-[#f0e130]/10 text-[#f0e130] border border-[#f0e130]/20"
                         : "bg-[#1a1a2e] text-[#6a6a8a]"
                     }`}>
                       {val.status}
