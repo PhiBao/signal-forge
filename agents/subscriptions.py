@@ -18,8 +18,9 @@ class Subscription(BaseModel):
     subscribed_at: datetime = Field(default_factory=datetime.utcnow)
     signals_received: int = 0
     total_paid_usd: float = 0
-    price_per_signal_usd: float = 0.01  # 1 cent per signal via nanopayments
+    price_per_signal_usd: float = 0.01
     active: bool = True
+    payment_txs: list[dict] = []  # [{tx_hash, network, amount, timestamp}]
 
 
 class CopyTradeRecord(BaseModel):
@@ -69,12 +70,13 @@ class SubscriptionManager:
                 "total_paid": s.total_paid_usd,
                 "price_per_signal": s.price_per_signal_usd,
                 "active": s.active,
+                "payment_txs": s.payment_txs,
             }
             for s in self.subscriptions.values()
             if s.active
         ]
 
-    def record_signal_delivery(self, subscription_id: str, nanopayment_tx: str = "") -> float:
+    def record_signal_delivery(self, subscription_id: str, nanopayment_tx: dict | None = None) -> float:
         """Record that a signal was delivered to a subscriber."""
         sub = self.subscriptions.get(subscription_id)
         if not sub or not sub.active:
@@ -84,6 +86,14 @@ class SubscriptionManager:
         sub.total_paid_usd += sub.price_per_signal_usd
         self.total_revenue_usd += sub.price_per_signal_usd
         self.total_signals_delivered += 1
+
+        if nanopayment_tx and nanopayment_tx.get("success"):
+            sub.payment_txs.append({
+                "tx_hash": nanopayment_tx.get("transaction", ""),
+                "network": nanopayment_tx.get("network", ""),
+                "amount": nanopayment_tx.get("amount", "0.01"),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
 
         logger.info(
             f"Signal delivered to {sub.user_address}: "

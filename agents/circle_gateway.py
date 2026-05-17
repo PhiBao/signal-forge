@@ -6,12 +6,18 @@ Docs: https://developers.circle.com/gateway
 import os
 import logging
 import httpx
+import time
+import hashlib
+import json
 from dotenv import load_dotenv
 load_dotenv()
 
 from agents.config import settings
 
 logger = logging.getLogger(__name__)
+
+GATEWAY_WALLET_CONTRACT = "0x0077777d7EBA4688BDeF3E311b846F25870A19B9"  # Arc Testnet
+ARC_CHAIN_ID = 5042002
 
 
 class CircleGatewayManager:
@@ -26,10 +32,11 @@ class CircleGatewayManager:
         self.api_key = settings.circle_api_key
         self.entity_secret = os.getenv("CIRCLE_ENTITY_SECRET", "")
         self.connected = False
-        self.gateway_url = "https://api-sandbox.circle.com/v1"
+        self.gateway_url = "https://gateway-api-testnet.circle.com"
+        self.payments_url = "https://api-sandbox.circle.com/v1"
 
-        if not self.api_key or not self.entity_secret:
-            logger.warning("Circle Gateway: API key or entity secret not configured")
+        if not self.api_key:
+            logger.warning("Circle Gateway: API key not configured")
             return
 
         self.connected = True
@@ -41,26 +48,123 @@ class CircleGatewayManager:
             "Content-Type": "application/json",
         }
 
-    async def get_unified_balance(self, wallet_id: str) -> dict:
+    def get_payment_requirements(self, seller_address: str, amount_usdc: str) -> dict:
         """
-        Get unified USDC balance across all chains for a wallet.
-        Gateway combines USDC from multiple chains into one spendable balance.
+        Get the payment requirements for a nanopayment.
+        Frontend uses this to construct the EIP-712 domain and sign.
+        """
+        network = "eip155:5042002"  # Arc Testnet CAIP-2
+        amount_atomic = str(int(float(amount_usdc) * 1e6))  # USDC has 6 decimals
+
+        return {
+            "scheme": "exact",
+            "network": network,
+            "asset": settings.usdc_contract_address,
+            "amount": amount_atomic,
+            "payTo": seller_address,
+            "maxTimeoutSeconds": 604800,  # 7 days
+            "extra": {
+                "name": "GatewayWalletBatched",
+                "version": "1",
+                "verifyingContract": GATEWAY_WALLET_CONTRACT,
+            },
+            "eip712_domain": {
+                "name": "GatewayWalletBatched",
+                "version": "1",
+                "chainId": ARC_CHAIN_ID,
+                "verifyingContract": GATEWAY_WALLET_CONTRACT,
+            },
+        }
+
+    async def nanopayment_settle(
+        self,
+        payer_address: str,
+        seller_address: str,
+        amount_usdc: str,
+        resource_url: str = "/api/signals",
+        signed_payload: dict | None = None,
+    ) -> dict:
+        """
+        Settle an x402 nanopayment via Circle Gateway.
+        
+        If signed_payload is provided (from frontend), attempts real settlement.
+        Otherwise falls back to demo mode.
         """
         if not self.connected:
-            return {"available": "0", "chains": {}}
+            return {"success": False, "error": "gateway_not_connected"}
+
+        network = "eip155:5042002"
+        amount_atomic = str(int(float(amount_usdc) * 1e6))
 
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{self.gateway_url}/wallets/{wallet_id}/balances",
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("data", {})
-                return {"available": "0", "chains": {}}
+            requirements = {
+                "scheme": "exact",
+                "network": network,
+                "asset": settings.usdc_contract_address,
+                "amount": amount_atomic,
+                "payTo": seller_address,
+                "maxTimeoutSeconds": 604800,
+                "extra": {
+                    "name": "GatewayWalletBatched",
+                    "version": "1",
+                    "verifyingContract": GATEWAY_WALLET_CONTRACT,
+                },
+            }
+
+            if signed_payload:
+                # Real settlement with frontend-signed payload
+                payment_payload = {
+                    "x402Version": 2,
+                    "resource": {
+                        "url": resource_url,
+                        "description": "SignalForge AI prediction market signal",
+                        "mimeType": "application/json",
+                    },
+                    "accepted": requirements,
+                    "payload": signed_payload,
+                }
+
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        f"{self.gateway_url}/v1/x402/settle",
+                        headers=self._headers(),
+                        json={
+                            "paymentPayload": payment_payload,
+                            "paymentRequirements": requirements,
+                        },
+                    )
+
+                    result = resp.json()
+                    if result.get("success"):
+                        tx_hash = result.get("transaction", "")
+                        logger.info(f"Nanopayment settled: {amount_usdc} USDC from {payer_address[:10]}... tx={tx_hash[:16]}...")
+                        return {
+                            "success": True,
+                            "transaction": tx_hash,
+                            "network": result.get("network", network),
+                            "amount": amount_usdc,
+                        }
+                    else:
+                        error_reason = result.get("errorReason", result.get("message", "unknown"))
+                        logger.warning(f"Nanopayment settlement failed: {error_reason}")
+                        return {
+                            "success": False,
+                            "error": error_reason,
+                            "raw_response": result,
+                        }
+            else:
+                # No signature provided — reject, don't fall back to demo
+                logger.warning(f"Nanopayment rejected: no signed payload from {payer_address[:10]}...")
+                return {
+                    "success": False,
+                    "error": "no_signed_payload",
+                }
         except Exception as e:
-            logger.error(f"Gateway balance fetch failed: {e}")
-            return {"available": "0", "chains": {}}
+            logger.error(f"Nanopayment settlement failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
 
     async def transfer_unified(
         self,
@@ -71,7 +175,6 @@ class CircleGatewayManager:
     ) -> dict:
         """
         Transfer USDC from unified balance to any address on any chain.
-        Gateway handles the cross-chain routing automatically.
         """
         if not self.connected:
             return {"status": "skipped", "reason": "not_connected"}
@@ -79,7 +182,7 @@ class CircleGatewayManager:
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    f"{self.gateway_url}/wallets/{wallet_id}/transfers",
+                    f"{self.gateway_url}/v1/wallets/{wallet_id}/transfers",
                     headers=self._headers(),
                     json={
                         "destinationAddress": destination_address,
@@ -92,39 +195,6 @@ class CircleGatewayManager:
             logger.error(f"Gateway transfer failed: {e}")
             return {"status": "error", "reason": str(e)}
 
-    async def nanopayment(
-        self,
-        wallet_id: str,
-        merchant_address: str,
-        amount: str,
-        idempotency_key: str,
-    ) -> dict:
-        """
-        Send a nanopayment (gas-free USDC as small as $0.000001).
-        Used for per-signal micropayments from subscribers to the agent.
-        """
-        if not self.connected:
-            return {"status": "skipped", "reason": "not_connected"}
-
-        try:
-            headers = {
-                **self._headers(),
-                "Idempotency-Key": idempotency_key,
-            }
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    f"{self.gateway_url}/wallets/{wallet_id}/nanopayments",
-                    headers=headers,
-                    json={
-                        "merchantAddress": merchant_address,
-                        "amount": amount,
-                    },
-                )
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Nanopayment failed: {e}")
-            return {"status": "error", "reason": str(e)}
-
     async def deposit_to_gateway(
         self,
         wallet_id: str,
@@ -133,7 +203,6 @@ class CircleGatewayManager:
     ) -> dict:
         """
         Deposit USDC from a source chain into the Gateway unified balance.
-        Enables cross-chain USDC for the agent.
         """
         if not self.connected:
             return {"status": "skipped", "reason": "not_connected"}
@@ -141,7 +210,7 @@ class CircleGatewayManager:
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    f"{self.gateway_url}/wallets/{wallet_id}/deposits",
+                    f"{self.gateway_url}/v1/wallets/{wallet_id}/deposits",
                     headers=self._headers(),
                     json={
                         "amount": amount,

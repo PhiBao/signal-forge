@@ -2,13 +2,24 @@
 SignalForge FastAPI server.
 """
 
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from agents.config import UserStrategy
 from agents.models import StrategyMode, RiskLevel
 from agents.orchestrator import Orchestrator
 from agents.circle_stack import get_stack_status
+from agents.config import settings
+import httpx
+
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 orchestrator: Orchestrator | None = None
 
@@ -23,7 +34,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SignalForge",
     description="Autonomous prediction market agent powered by DGrid AI. Reasoning traces anchored on Arc. Subscriptions via Circle Nanopayments.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -38,7 +49,23 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0", "ai_provider": "dgrid", "settlement": "arc"}
+    return {"status": "ok", "version": "3.0.0", "ai_provider": "dgrid", "settlement": "arc"}
+
+
+@app.post("/api/arc/rpc")
+async def arc_rpc_proxy(request: Request):
+    """Proxy Arc RPC calls from the frontend to avoid CORS issues."""
+    try:
+        body = await request.json()
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                settings.arc_rpc_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+            )
+            return JSONResponse(content=resp.json())
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.get("/api/config")
@@ -289,16 +316,73 @@ async def seed_demo():
 
 # --- Subscription Endpoints ---
 
+@app.get("/api/subscribe/payment-requirements")
+async def get_payment_requirements(user_address: str, price: float = 0.01):
+    """Get EIP-712 payment requirements for x402 nanopayment signing."""
+    if not orchestrator:
+        return {"error": "not ready"}
+    seller_address = orchestrator.executor.arc.account.address if orchestrator.executor.arc.account else ""
+    if not seller_address:
+        return {"error": "seller_address not available"}
+    return orchestrator.executor.gateway.get_payment_requirements(seller_address, str(price))
+
+
 @app.post("/api/subscribe")
 async def subscribe(data: dict):
-    """Subscribe to agent signals. Pay per signal via Circle Nanopayments."""
+    """Subscribe to agent signals. Pay per signal via Circle Nanopayments (x402)."""
     if not orchestrator:
         return {"error": "not ready"}
     user_address = data.get("user_address", "")
     price = float(data.get("price_per_signal", 0.01))
+    signed_payload = data.get("signed_payload")
     if not user_address:
         return {"error": "user_address required"}
-    return orchestrator.subscribe_user(user_address, price)
+
+    logger.info(f"Subscribe request: user={user_address[:10]}... has_signed_payload={signed_payload is not None}")
+
+    result = orchestrator.subscribe_user(user_address, price)
+
+    # If signed payload provided, settle initial nanopayment via Gateway
+    if signed_payload and orchestrator.gateway.connected:
+        seller_address = orchestrator.executor.arc.account.address if orchestrator.executor.arc.account else ""
+        if seller_address:
+            import asyncio
+            asyncio.create_task(
+                settle_subscription_nanopayment(
+                    user_address, seller_address, price, result.get("subscription_id", ""), signed_payload
+                )
+            )
+        else:
+            logger.error("No seller address available for nanopayment settlement")
+
+    return result
+
+
+async def settle_subscription_nanopayment(
+    user_address: str, seller_address: str, price: float, sub_id: str, signed_payload: dict
+):
+    """Settle nanopayment for a new subscription via Circle Gateway x402."""
+    if not orchestrator:
+        logger.error("Orchestrator not ready for nanopayment settlement")
+        return
+    try:
+        logger.info(f"Settling subscription nanopayment for {user_address[:10]}... amount=${price}")
+        result = await orchestrator.executor.gateway.nanopayment_settle(
+            payer_address=user_address,
+            seller_address=seller_address,
+            amount_usdc=str(price),
+            resource_url="/api/subscribe",
+            signed_payload=signed_payload,
+        )
+        logger.info(f"Nanopayment settlement result: {result}")
+        if result.get("success"):
+            orchestrator.subscriptions.record_signal_delivery(sub_id, nanopayment_tx=result)
+            tx_hash = result.get("transaction", "")
+            logger.info(f"Subscription nanopayment batch: {tx_hash[:12] if tx_hash else 'none'}...")
+        else:
+            logger.error(f"Subscription nanopayment failed: {result.get('error')}")
+    except Exception as e:
+        logger.error(f"Subscription nanopayment exception: {e}", exc_info=True)
 
 
 @app.get("/api/subscriptions")

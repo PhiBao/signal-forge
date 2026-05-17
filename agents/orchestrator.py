@@ -196,7 +196,7 @@ class Orchestrator:
             "subscription_id": sub.id,
             "user_address": sub.user_address,
             "price_per_signal": sub.price_per_signal_usd,
-            "message": "Subscribed to SignalForge signals. Pay per signal via Circle Nanopayments.",
+            "message": "Subscribed. Pay per signal via Circle Nanopayments (x402).",
         }
 
     @property

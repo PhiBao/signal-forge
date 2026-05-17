@@ -2,10 +2,17 @@
 
 import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { useAccount, useConnect, useDisconnect } from "wagmi";
+import { useAccount, useConnect, useDisconnect, useSignTypedData, useWriteContract, useReadContract } from "wagmi";
 import { injected } from "wagmi/connectors";
+import { parseUnits, formatUnits } from "viem";
 
 const API = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const USDC_ADDRESS = "0x3600000000000000000000000000000000000000";
+
+const USDC_ABI = [
+  { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "account", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+  { name: "transfer", type: "function", stateMutability: "nonpayable", inputs: [{ name: "to", type: "address" }, { name: "amount", type: "uint256" }], outputs: [{ name: "", type: "bool" }] },
+] as const;
 
 function fetchJson(url: string) {
   return fetch(`${API}${url}`).then((r) => r.json());
@@ -38,6 +45,7 @@ export default function Home() {
   const [showTerminal, setShowTerminal] = useState(false);
   const [agentLogs, setAgentLogs] = useState<string[]>([]);
   const [isScanning, setIsScanning] = useState(false);
+  const [showDepositPrompt, setShowDepositPrompt] = useState(false);
 
   const { address, isConnected } = useAccount();
   const { connect } = useConnect();
@@ -94,7 +102,7 @@ export default function Home() {
     refetchInterval: 10000,
   });
 
-  const { data: subscriptions } = useQuery({
+  const { data: subscriptions, refetch: refetchSubscriptions } = useQuery({
     queryKey: ["subscriptions"],
     queryFn: () => fetchJson("/api/subscriptions"),
     refetchInterval: 10000,
@@ -169,11 +177,84 @@ export default function Home() {
     },
   });
 
+  const { signTypedDataAsync } = useSignTypedData();
+  const { writeContractAsync } = useWriteContract();
+
+  const { data: usdcBalance } = useReadContract({
+    address: USDC_ADDRESS,
+    abi: USDC_ABI,
+    functionName: "balanceOf",
+    args: address ? [address] : undefined,
+    query: { enabled: !!address },
+  });
+
   const subscribeMutation = useMutation({
-    mutationFn: (addr: string) => postJson("/api/subscribe", { user_address: addr }),
-    onSuccess: (_, addr) => {
+    mutationFn: async (addr: string) => {
+      addLog("Fetching x402 payment requirements from Circle Gateway...");
+      const requirements = await fetchJson(`/api/subscribe/payment-requirements?user_address=${addr}&price=0.01`);
+
+      if (requirements.eip712_domain) {
+        addLog("Signing EIP-712 authorization for Circle Nanopayments...");
+        const domain = requirements.eip712_domain;
+        const types = {
+          TransferWithAuthorization: [
+            { name: "from", type: "address" },
+            { name: "to", type: "address" },
+            { name: "value", type: "uint256" },
+            { name: "validAfter", type: "uint256" },
+            { name: "validBefore", type: "uint256" },
+            { name: "nonce", type: "bytes32" },
+          ],
+        };
+
+        const validBefore = BigInt(Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60);
+        const nonce = `0x${Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, "0")).join("")}`;
+
+        const message = {
+          from: addr as `0x${string}`,
+          to: requirements.payTo as `0x${string}`,
+          value: BigInt(requirements.amount),
+          validAfter: BigInt(0),
+          validBefore,
+          nonce: nonce as `0x${string}`,
+        };
+
+        const signature = await signTypedDataAsync({
+          domain: {
+            name: domain.name,
+            version: domain.version,
+            chainId: domain.chainId,
+            verifyingContract: domain.verifyingContract as `0x${string}`,
+          },
+          types,
+          primaryType: "TransferWithAuthorization",
+          message,
+        });
+
+        addLog("Signature obtained, submitting to Circle Gateway for x402 settlement...");
+        return postJson("/api/subscribe", {
+          user_address: addr,
+          price_per_signal: 0.01,
+          signed_payload: {
+            authorization: {
+              from: message.from,
+              to: requirements.payTo,
+              value: message.value.toString(),
+              validAfter: message.validAfter.toString(),
+              validBefore: message.validBefore.toString(),
+              nonce: message.nonce,
+            },
+            signature,
+          },
+        });
+      }
+
+      return postJson("/api/subscribe", { user_address: addr });
+    },
+    onSuccess: async (_, addr) => {
       refetchStatus();
-      addLog(`New subscriber: ${addr.slice(0, 8)}... — $0.01/signal via Circle Nanopayments`);
+      await refetchSubscriptions();
+      addLog(`Subscribed: ${addr.slice(0, 8)}... — $0.01/signal via Circle Nanopayments`);
     },
   });
 
@@ -184,7 +265,7 @@ export default function Home() {
   };
 
   const handleSubscribe = () => {
-    const addr = subAddress || address || "";
+    const addr = address || subAddress || "";
     if (addr) {
       subscribeMutation.mutate(addr);
       setSubAddress("");
@@ -292,7 +373,7 @@ export default function Home() {
         <header className="terminal-panel terminal-panel-active mb-4">
           <div className="terminal-header">
             <span className="text-[#00ff41] font-bold">signalforge</span>
-            <span className="text-[#6a6a8a]">v2.0.0</span>
+            <span className="text-[#6a6a8a]">v3.0.0</span>
             <span className="flex-1" />
             <span className="text-[#6a6a8a]">arc-testnet</span>
             <span className="text-[#6a6a8a]">dgrid-ai</span>
@@ -320,14 +401,16 @@ export default function Home() {
               </button>
               {isConnected ? (
                 <div className="flex items-center gap-2">
-                  <span className="text-[9px] text-[#6a6a8a] uppercase">poly/arc</span>
+                  <span className="text-[9px] text-[#00ff41] font-bold border border-[#00ff41]/30 px-2 py-0.5 rounded">
+                    ● circle wallet
+                  </span>
                   <button className="cyber-btn" onClick={() => disconnect()}>
                     <span className="text-[#00f0ff]">{address?.slice(0, 6)}...{address?.slice(-4)}</span>
                   </button>
                 </div>
               ) : (
                 <button className="cyber-btn cyber-btn-primary" onClick={() => connect({ connector: injected() })}>
-                  connect
+                  connect circle wallet
                 </button>
               )}
             </div>
@@ -473,6 +556,15 @@ export default function Home() {
                     <div className="text-[9px] text-[#6a6a8a] uppercase">per signal</div>
                   </div>
                 </div>
+                <div className="mb-3 p-3 bg-[#07070c] rounded border border-[#1a1a2e]">
+                  <div className="text-[10px] text-[#6a6a8a] mb-1">how nanopayments work</div>
+                  <div className="text-[11px] text-[#e0e0e0] space-y-1">
+                    <p>1. Sign EIP-712 authorization (gas-free, off-chain)</p>
+                    <p>2. <span className="text-[#00f0ff]">Circle Gateway</span> verifies & batches via x402 protocol</p>
+                    <p>3. Batch settled on Arc periodically — batch ID shown below</p>
+                    <p>4. $0.01/signal · gas-free · cross-chain via Gateway</p>
+                  </div>
+                </div>
                 <div className="grid grid-cols-3 gap-3 text-center mb-3">
                   <div className="p-2 bg-[#07070c] rounded border border-[#1a1a2e]">
                     <div className="text-xs font-bold text-[#00f0ff]">DGrid AI</div>
@@ -495,14 +587,66 @@ export default function Home() {
                     onChange={(e) => setSubAddress(e.target.value)}
                     className="flex-1 min-w-[200px] bg-[#0d0d14] border border-[#1a1a2e] text-[#e0e0e0] text-xs px-3 py-2 rounded font-mono outline-none focus:border-[#00ff41]"
                   />
-                  <button
-                    className="cyber-btn cyber-btn-primary"
-                    onClick={handleSubscribe}
-                    disabled={subscribeMutation.isPending}
-                  >
-                    {subscribeMutation.isPending ? "subscribing..." : "⚡ subscribe now"}
-                  </button>
+                  {isConnected && (
+                    <button
+                      className="cyber-btn"
+                      onClick={() => setShowDepositPrompt(true)}
+                      disabled={subscribeMutation.isPending || !(subAddress || address)}
+                    >
+                      {subscribeMutation.isPending ? "subscribing..." : "⚡ subscribe now"}
+                    </button>
+                  )}
                 </div>
+
+                {/* Deposit Prompt */}
+                {showDepositPrompt && (
+                  <div className="mt-4 p-4 bg-[#07070c] border border-[#f0e130]/30 rounded-lg">
+                    <div className="flex items-start gap-3">
+                      <span className="text-[#f0e130] text-lg">◈</span>
+                      <div className="flex-1">
+                        <h4 className="text-sm font-bold text-[#f0e130] mb-1">Circle Nanopayments (x402)</h4>
+                        <p className="text-[11px] text-[#6a6a8a] mb-3">
+                          Sign an EIP-712 authorization to pay $0.01/signal via Circle Gateway. Gas-free, batched settlement on Arc.
+                        </p>
+                        <div className="flex items-center gap-3 mb-3">
+                          <div className="flex-1 p-2 bg-[#0d0d14] rounded border border-[#1a1a2e]">
+                            <div className="text-[9px] text-[#6a6a8a] uppercase">Your USDC Balance</div>
+                            <div className="text-sm font-bold text-[#00ff41]">
+                              {usdcBalance ? `$${formatUnits(usdcBalance, 6)}` : "Loading..."}
+                            </div>
+                          </div>
+                          <div className="flex-1 p-2 bg-[#0d0d14] rounded border border-[#1a1a2e]">
+                            <div className="text-[9px] text-[#6a6a8a] uppercase">Price</div>
+                            <div className="text-sm font-bold text-[#00f0ff]">$0.01/signal</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            className="cyber-btn cyber-btn-primary"
+                            onClick={() => {
+                              setShowDepositPrompt(false);
+                              handleSubscribe();
+                            }}
+                            disabled={!usdcBalance || usdcBalance === BigInt(0)}
+                          >
+                            sign & subscribe via x402
+                          </button>
+                          <button
+                            className="cyber-btn"
+                            onClick={() => setShowDepositPrompt(false)}
+                          >
+                            cancel
+                          </button>
+                        </div>
+                        {usdcBalance === BigInt(0) && (
+                          <p className="text-[10px] text-[#ff2244] mt-2">
+                            No USDC in wallet. Get testnet USDC from <a href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer" className="text-[#00f0ff] underline">faucet.circle.com</a>
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Subscriber List */}
@@ -511,10 +655,24 @@ export default function Home() {
                   <div className="text-[9px] font-bold text-[#6a6a8a] uppercase tracking-widest mb-2">active subscribers</div>
                   <div className="space-y-1">
                     {subscriptions.map((sub: any) => (
-                      <div key={sub.id} className="flex items-center justify-between text-xs py-2 px-3 bg-[#07070c] rounded border border-[#1a1a2e]">
-                        <span className="text-[#e0e0e0] font-mono">{sub.user_address.slice(0, 10)}...{sub.user_address.slice(-6)}</span>
-                        <span className="text-[#6a6a8a]">{sub.signals_received} signals</span>
-                        <span className="text-[#00ff41]">${sub.total_paid?.toFixed(4)}</span>
+                      <div key={sub.id} className="text-xs py-2 px-3 bg-[#07070c] rounded border border-[#1a1a2e]">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[#e0e0e0] font-mono">{sub.user_address.slice(0, 10)}...{sub.user_address.slice(-6)}</span>
+                          <span className="text-[#6a6a8a]">{sub.signals_received} signals</span>
+                          <span className="text-[#00ff41]">${sub.total_paid?.toFixed(4)}</span>
+                        </div>
+                        {sub.payment_txs && sub.payment_txs.length > 0 && (
+                          <div className="mt-1.5 space-y-0.5">
+                            {sub.payment_txs.slice(-3).map((tx: any, j: number) => (
+                              <div key={j} className="flex items-center gap-2 text-[10px]">
+                                <span className="text-[#00f0ff]">◈</span>
+                                <span className="text-[#6a6a8a] font-mono">{tx.tx_hash?.slice(0, 12)}...</span>
+                                <span className="text-[#00ff41]">${tx.amount}</span>
+                                <span className="text-[9px] px-1 py-0 rounded bg-[#00f0ff]/10 text-[#00f0ff] border border-[#00f0ff]/20">x402 batch</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -709,18 +867,23 @@ export default function Home() {
                           <div className="text-[10px] text-[#6a6a8a]">
                             MKT <span className="text-[#e0e0e0] font-bold">{(s.market_implied_probability * 100).toFixed(0)}%</span>
                           </div>
-                          {s.reasoning?.arc_tx_hash ? (
-                            <a
-                              href={`https://testnet.arcscan.app/tx/${s.reasoning.arc_tx_hash}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-[9px] text-[#b829dd] hover:text-[#b829dd]/80 underline underline-offset-2 block mt-0.5"
-                            >
-                              ↗ trace
-                            </a>
-                          ) : (
-                            <span className="text-[9px] text-[#3a3a5a] block mt-0.5">not anchored</span>
-                          )}
+                          {(() => {
+                            const isReal = s.reasoning?.arc_tx_hash?.startsWith("0x") && s.reasoning?.arc_tx_hash?.length === 66;
+                            return isReal ? (
+                              <a
+                                href={`https://testnet.arcscan.app/tx/${s.reasoning.arc_tx_hash}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[9px] text-[#b829dd] hover:text-[#b829dd]/80 underline underline-offset-2 block mt-0.5"
+                              >
+                                ↗ trace
+                              </a>
+                            ) : s.reasoning?.arc_tx_hash ? (
+                              <span className="text-[9px] text-[#f0e130] block mt-0.5">◈ demo</span>
+                            ) : (
+                              <span className="text-[9px] text-[#3a3a5a] block mt-0.5">not anchored</span>
+                            );
+                          })()}
                         </div>
                       </div>
                     </div>
@@ -765,11 +928,16 @@ export default function Home() {
                             <p>model: <span className="text-[#e0e0e0]">{s.reasoning?.model_used || "dgrid"}</span></p>
                             <p>kelly: <span className="text-[#e0e0e0]">{s.kelly_fraction}x</span></p>
                             <p>version: <span className="text-[#e0e0e0]">{s.version}</span></p>
-                            {s.reasoning?.arc_tx_hash && (
-                              <a href={`https://testnet.arcscan.app/tx/${s.reasoning.arc_tx_hash}`} target="_blank" rel="noopener noreferrer" className="cyber-link block mt-2">
-                                ↗ arcscan tx
-                              </a>
-                            )}
+                            {(() => {
+                              const isReal = s.reasoning?.arc_tx_hash?.startsWith("0x") && s.reasoning?.arc_tx_hash?.length === 66;
+                              return isReal ? (
+                                <a href={`https://testnet.arcscan.app/tx/${s.reasoning.arc_tx_hash}`} target="_blank" rel="noopener noreferrer" className="cyber-link block mt-2">
+                                  ↗ arcscan tx
+                                </a>
+                              ) : s.reasoning?.arc_tx_hash ? (
+                                <span className="text-[#f0e130] block mt-2">◈ demo trace</span>
+                              ) : null;
+                            })()}
                             <a href={s.market.url} target="_blank" rel="noopener noreferrer" className="cyber-link block">
                               ↗ polymarket
                             </a>
@@ -823,22 +991,32 @@ export default function Home() {
                         </span>
                       </td>
                       <td className="text-right">
-                        {t.arc_trace_hash ? (
-                          <a href={`https://testnet.arcscan.app/tx/${t.arc_trace_hash}`} target="_blank" rel="noopener noreferrer" className="cyber-link text-[10px]">
-                            ↗ trace
-                          </a>
-                        ) : (
-                          <span className="text-[#3a3a5a] text-[10px]">—</span>
-                        )}
+                        {(() => {
+                          const isReal = t.arc_trace_hash?.startsWith("0x") && t.arc_trace_hash?.length === 66;
+                          return isReal ? (
+                            <a href={`https://testnet.arcscan.app/tx/${t.arc_trace_hash}`} target="_blank" rel="noopener noreferrer" className="cyber-link text-[10px]">
+                              ↗ trace
+                            </a>
+                          ) : t.arc_trace_hash ? (
+                            <span className="text-[#6a6a8a] text-[10px] font-mono">{t.arc_trace_hash.slice(0, 10)}...</span>
+                          ) : (
+                            <span className="text-[#3a3a5a] text-[10px]">—</span>
+                          );
+                        })()}
                       </td>
                       <td className="text-right">
-                        {t.gateway_tx ? (
-                          <a href={`https://testnet.arcscan.app/tx/${t.gateway_tx}`} target="_blank" rel="noopener noreferrer" className="cyber-link text-[10px] text-[#f0e130]">
-                            ↗ $0.10 usdc
-                          </a>
-                        ) : (
-                          <span className="text-[#3a3a5a] text-[10px]">—</span>
-                        )}
+                        {(() => {
+                          const isReal = t.gateway_tx?.startsWith("0x") && t.gateway_tx?.length === 66;
+                          return isReal ? (
+                            <a href={`https://testnet.arcscan.app/tx/${t.gateway_tx}`} target="_blank" rel="noopener noreferrer" className="cyber-link text-[10px] text-[#f0e130]">
+                              ↗ $0.10 usdc
+                            </a>
+                          ) : t.gateway_tx ? (
+                            <span className="text-[#6a6a8a] text-[10px] font-mono">{t.gateway_tx.slice(0, 10)}...</span>
+                          ) : (
+                            <span className="text-[#3a3a5a] text-[10px]">—</span>
+                          );
+                        })()}
                       </td>
                       <td className="text-right text-[#6a6a8a]">{t.status}</td>
                     </tr>

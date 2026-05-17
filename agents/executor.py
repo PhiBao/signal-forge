@@ -102,19 +102,10 @@ class ExecutorAgent:
                 settlement_tx = await self._settle_trade_on_arc(signal.position_size_usd)
                 trade.gateway_tx = settlement_tx
 
-        # Step 3: Notify subscribers and collect nanopayments
+        # Step 3: Notify subscribers (nanopayment settled at subscribe time via x402)
         if subscriber_ids:
             for sub_id in subscriber_ids:
-                revenue = self.subscriptions.record_signal_delivery(sub_id)
-                if self.gateway.connected:
-                    sub = self.subscriptions.subscriptions.get(sub_id)
-                    if sub:
-                        await self.gateway.nanopayment(
-                            wallet_id=sub.user_address,
-                            merchant_address=self.arc.account.address if self.arc.account else "",
-                            amount=str(int(revenue * 1e6)),
-                            idempotency_key=str(uuid.uuid4()),
-                        )
+                self.subscriptions.record_signal_delivery(sub_id)
 
         self.trades.append(trade)
         self.total_volume += trade.size_usd
@@ -171,6 +162,47 @@ class ExecutorAgent:
             return ""
         except Exception as e:
             logger.error(f"USDC settlement failed: {e}")
+            return ""
+
+    async def _send_nanopayment(self, to_address: str, amount_usd: float) -> str:
+        """
+        Send a nanopayment via real USDC transfer on Arc.
+        Arc gas is ~$0.01, matching the $0.01/signal price point.
+        Produces real on-chain tx hashes verifiable on ArcScan.
+        """
+        if not self.arc.connected or not self.arc.account:
+            return ""
+        
+        try:
+            amount_raw = int(amount_usd * 1e6)
+            
+            nonce = self.arc.w3.eth.get_transaction_count(self.arc.account.address)
+            gas_price = self.arc.w3.eth.gas_price
+            
+            transfer_tx = self.arc.usdc_contract.functions.transfer(
+                to_address,
+                amount_raw,
+            ).build_transaction({
+                "from": self.arc.account.address,
+                "nonce": nonce,
+                "gas": 100000,
+                "gasPrice": gas_price,
+                "chainId": settings.arc_chain_id,
+            })
+            
+            signed = self.arc.account.sign_transaction(transfer_tx)
+            tx_hash = self.arc.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash_hex = tx_hash.hex() if hasattr(tx_hash, 'hex') else tx_hash
+            if not tx_hash_hex.startswith("0x"):
+                tx_hash_hex = "0x" + tx_hash_hex
+            
+            receipt = self.arc.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+            
+            if receipt.status == 1:
+                return tx_hash_hex
+            return ""
+        except Exception as e:
+            logger.error(f"Nanopayment transfer failed: {e}")
             return ""
 
     async def _place_real_trade(self, signal: TradeSignal, arc_tx_hash: str | None) -> ExecutedTrade:

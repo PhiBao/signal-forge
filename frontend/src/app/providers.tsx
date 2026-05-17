@@ -5,7 +5,7 @@ import { WagmiProvider, createConfig, http } from "wagmi";
 import { defineChain } from "viem";
 import { injected } from "wagmi/connectors";
 
-const arcRpcUrl = process.env.NEXT_PUBLIC_ARC_RPC_URL || "https://rpc.testnet.arc-node.thecanteenapp.com";
+const arcRpcUrl = process.env.NEXT_PUBLIC_ARC_RPC_URL || "http://localhost:8000/api/arc/rpc";
 
 const arcTestnet = defineChain({
   id: 5042002,
