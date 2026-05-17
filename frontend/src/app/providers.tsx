@@ -5,13 +5,13 @@ import { WagmiProvider, createConfig, http } from "wagmi";
 import { defineChain } from "viem";
 import { injected } from "wagmi/connectors";
 
-const arcRpcUrl = process.env.NEXT_PUBLIC_ARC_RPC_URL || "http://localhost:8000/api/arc/rpc";
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
 const arcTestnet = defineChain({
   id: 5042002,
   name: "Arc Testnet",
   nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 18 },
-  rpcUrls: { default: { http: [arcRpcUrl] } },
+  rpcUrls: { default: { http: [`${backendUrl}/api/arc/rpc`] } },
 });
 
 const config = createConfig({
